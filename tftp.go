@@ -1,9 +1,10 @@
 package tftp
 
 import (
+	"context"
 	"fmt"
 	"net"
-	"os"
+	"time"
 )
 
 func sendErrorTFTP(conn *net.UDPConn, addr *net.UDPAddr, errCode int, errMsg string) (err error) {
@@ -20,7 +21,7 @@ func sendErrorTFTP(conn *net.UDPConn, addr *net.UDPAddr, errCode int, errMsg str
 	return
 }
 
-func parseRQQRequestTFTP(buffer []byte) (file string, mode string, err error) {
+func ParseRRQRequestTFTP(buffer []byte) (file string, mode string, err error) {
 	var (
 		start int      = 2
 		parts []string = make([]string, 0)
@@ -43,102 +44,62 @@ func parseRQQRequestTFTP(buffer []byte) (file string, mode string, err error) {
 	return
 }
 
-func sendFileTFTP(conn *net.UDPConn, addr *net.UDPAddr, filename string) (err error) {
-	var file *os.File
+func SendBufferTFTP(ctx context.Context, conn *net.UDPConn, addr *net.UDPAddr, content []byte) error {
+	blockNum := uint16(1)
+	offset := 0
 
-	if file, err = os.Open(filename); err != nil {
-		sendErrorTFTP(conn, addr, 1, "File not found")
-		return
+	// A zero-length file still requires a single data/ack exchange.
+	if len(content) == 0 {
+		content = []byte{}
 	}
 
-	defer file.Close()
-
-	var (
-		bytesRead int    = 0
-		blockNum  uint16 = 1
-		buffer    []byte = make([]byte, BLOCK_SIZE)
-	)
-
 	for {
-		if bytesRead, err = file.Read(buffer); err != nil {
-			return
+		chunkEnd := offset + BLOCK_SIZE
+		if chunkEnd > len(content) {
+			chunkEnd = len(content)
 		}
 
-		var dataPacket []byte = make([]byte, 4+bytesRead)
-		dataPacket[0] = 0
-		dataPacket[1] = OPCODE_DATA
-		dataPacket[2] = byte(blockNum >> 8)
-		dataPacket[3] = byte(blockNum)
-		copy(dataPacket[4:], buffer[:bytesRead])
+		chunk := content[offset:chunkEnd]
+		packet := make([]byte, 4+len(chunk))
+		packet[0] = 0
+		packet[1] = OPCODE_DATA
+		packet[2] = byte(blockNum >> 8)
+		packet[3] = byte(blockNum)
+		copy(packet[4:], chunk)
 
-		if _, err = conn.WriteToUDP(dataPacket, addr); err != nil {
-			return
+		if _, err := conn.WriteToUDP(packet, addr); err != nil {
+			return err
 		}
 
-		var ack []byte = make([]byte, 4)
-		if _, _, err = conn.ReadFromUDP(ack); err != nil {
-			return
+		ack := make([]byte, 4)
+		for {
+			_ = conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+			if _, _, err := conn.ReadFromUDP(ack); err != nil {
+				if ne, ok := err.(net.Error); ok && ne.Timeout() {
+					select {
+					case <-ctx.Done():
+						return ctx.Err()
+					default:
+						// resend last packet on timeout
+						if _, err := conn.WriteToUDP(packet, addr); err != nil {
+							return err
+						}
+						continue
+					}
+				}
+				return err
+			}
+
+			if ack[1] == OPCODE_ACK && ack[2] == byte(blockNum>>8) && ack[3] == byte(blockNum) {
+				break
+			}
 		}
 
-		if ack[1] != OPCODE_ACK || ack[2] != byte(blockNum>>8) || ack[3] != byte(blockNum) {
-			err = fmt.Errorf("invalid ACK received: %v", ack)
-			return
+		offset = chunkEnd
+		if offset >= len(content) && len(chunk) < BLOCK_SIZE {
+			return nil
 		}
 
 		blockNum++
-		if bytesRead < BLOCK_SIZE {
-			return
-		}
 	}
-}
-
-func serveTFTP(options Options) {
-	var (
-		address *net.UDPAddr
-		conn    *net.UDPConn
-		err     error
-	)
-
-	if address, err = net.ResolveUDPAddr("udp4", options.ListenAddrTFTP); err != nil {
-		panic(err)
-	}
-
-	if conn, err = net.ListenUDP("udp4", address); err != nil {
-		panic(err)
-	}
-
-	go func() {
-		defer conn.Close()
-
-		var (
-			buffer            []byte = make([]byte, 1024)
-			bytesRead, opCode int    = 0, OPCODE_ERROR
-			filename          string
-			err               error
-			clientAddr        *net.UDPAddr
-		)
-
-		for {
-			if bytesRead, clientAddr, err = conn.ReadFromUDP(buffer); err != nil {
-				continue
-			}
-
-			if bytesRead < 4 {
-				continue
-			}
-
-			opCode = int(buffer[1])
-
-			if opCode == OPCODE_RRQ {
-				if filename, _, err = parseRQQRequestTFTP(buffer[:bytesRead]); err != nil {
-					sendErrorTFTP(conn, clientAddr, 0, "Invalid request")
-					continue
-				}
-
-				if err = sendFileTFTP(conn, clientAddr, filename); err != nil {
-					continue
-				}
-			}
-		}
-	}()
 }
