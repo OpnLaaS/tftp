@@ -205,7 +205,9 @@ func (s *Server) startHTTP(ctx context.Context) error {
 		return nil
 	}
 
-	ln, err := net.Listen("tcp", s.Options.ListenAddrHTTP)
+	network := selectHTTPNetwork(s.Options.ListenAddrHTTP)
+
+	ln, err := net.Listen(network, s.Options.ListenAddrHTTP)
 	if err != nil {
 		return err
 	}
@@ -229,6 +231,31 @@ func (s *Server) startHTTP(ctx context.Context) error {
 	}()
 
 	return nil
+}
+
+// selectHTTPNetwork picks an explicit network so IPv4 binds stay on IPv4-only sockets.
+func selectHTTPNetwork(addr string) string {
+	network := "tcp"
+
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		return network
+	}
+
+	if host == "" {
+		return "tcp4"
+	}
+
+	ip := net.ParseIP(host)
+	if ip == nil {
+		return network
+	}
+
+	if ip.To4() != nil {
+		return "tcp4"
+	}
+
+	return "tcp6"
 }
 
 // HTTPHandler returns the HTTP handler used for serving dynamic artifacts.
